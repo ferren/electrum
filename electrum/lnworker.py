@@ -64,6 +64,9 @@ from .lnrouter import RouteEdge, LNPaymentRoute, is_route_sane_to_use
 from .address_synchronizer import TX_HEIGHT_LOCAL
 from . import lnsweep
 from .lnwatcher import LNWalletWatcher
+from .crypto import pw_encode_bytes, pw_decode_bytes, PW_HASH_VERSION_LATEST
+from .lnutil import ChannelBackup
+from .lnchannel import PassiveChannel
 
 if TYPE_CHECKING:
     from .network import Network
@@ -439,6 +442,10 @@ class LNWallet(LNWorker):
         for channel_id, c in channels.items():
             self.channels[bfh(channel_id)] = Channel(c, sweep_address=self.sweep_address, lnworker=self)
 
+        self.channel_backups = {}
+        for channel_id, cb in self.db.get_dict("channel_backups").items():
+            self.channel_backups[bfh(channel_id)] = PassiveChannel(cb, sweep_address=self.sweep_address, lnworker=self)
+
         self.pending_payments = defaultdict(asyncio.Future)  # type: Dict[bytes, asyncio.Future[BarePaymentAttemptLog]]
 
     @ignore_exceptions
@@ -492,8 +499,11 @@ class LNWallet(LNWorker):
         self.lnwatcher = LNWalletWatcher(self, network)
         self.lnwatcher.start_network(network)
         self.network = network
-        for chan_id, chan in self.channels.items():
+
+        for chan in self.channels.values():
             self.lnwatcher.add_channel(chan.funding_outpoint.to_str(), chan.get_funding_address())
+        for cb in self.channel_backups.values():
+            self.lnwatcher.add_channel(cb.funding_outpoint.to_str(), cb.get_funding_address())
 
         super().start_network(network)
         for coro in [
@@ -692,7 +702,11 @@ class LNWallet(LNWorker):
     def channel_by_txo(self, txo):
         with self.lock:
             channels = list(self.channels.values())
+            channel_backups = list(self.channel_backups.values())
         for chan in channels:
+            if chan.funding_outpoint.to_str() == txo:
+                return chan
+        for chan in channel_backups:
             if chan.funding_outpoint.to_str() == txo:
                 return chan
 
@@ -794,8 +808,6 @@ class LNWallet(LNWorker):
     def open_channel(self, *, connect_str: str, funding_tx: PartialTransaction,
                      funding_sat: int, push_amt_sat: int, password: str = None,
                      timeout: Optional[int] = 20) -> Tuple[Channel, PartialTransaction]:
-        if self.wallet.is_lightning_backup():
-            raise Exception(_('Cannot create channel: this is a backup file'))
         if funding_sat > LN_MAX_FUNDING_SAT:
             raise Exception(_("Requested channel capacity is over protocol allowed maximum."))
         coro = self._open_channel_coroutine(connect_str=connect_str, funding_tx=funding_tx, funding_sat=funding_sat,
@@ -1345,3 +1357,49 @@ class LNWallet(LNWorker):
         if feerate_per_kvbyte is None:
             feerate_per_kvbyte = FEERATE_FALLBACK_STATIC_FEE
         return max(253, feerate_per_kvbyte // 4)
+
+    def create_channel_backup(self, channel_id):
+        chan = self.channels[channel_id]
+        peer_addresses = list(chan.get_peer_addresses())
+        peer_addr = peer_addresses[0]
+        return ChannelBackup(
+            node_id = chan.node_id,
+            privkey = self.node_keypair.privkey,
+            funding_txid = chan.funding_outpoint.txid,
+            funding_index = chan.funding_outpoint.output_index,
+            funding_address = chan.get_funding_address(),
+            host = peer_addr.host,
+            port = peer_addr.port,
+            is_initiator = chan.constraints.is_initiator,
+            local_seed = chan.config[LOCAL].seed,
+            local_delay = chan.config[LOCAL].to_self_delay,
+            remote_delay = chan.config[REMOTE].to_self_delay,
+            remote_revocation_pubkey = chan.config[REMOTE].revocation_basepoint.pubkey,
+            remote_payment_pubkey = chan.config[REMOTE].payment_basepoint.pubkey)
+
+    def export_channel_backup(self, channel_id):
+        xpub = self.wallet.get_fingerprint()
+        backup_bytes = self.create_channel_backup(channel_id).to_bytes()
+        assert backup_bytes == ChannelBackup.from_bytes(backup_bytes).to_bytes(), "roundtrip failed"
+        encrypted = pw_encode_bytes(backup_bytes, xpub, version=PW_HASH_VERSION_LATEST)
+        assert backup_bytes == pw_decode_bytes(encrypted, xpub, version=PW_HASH_VERSION_LATEST), "encrypt failed"
+        return encrypted
+
+    def import_channel_backup(self, encrypted):
+        xpub = self.wallet.get_fingerprint()
+        x = pw_decode_bytes(encrypted, xpub, version=PW_HASH_VERSION_LATEST)
+        cb = ChannelBackup.from_bytes(x)
+        channel_id = cb.channel_id()
+        if channel_id in self.channels:
+            raise Exception('Channel already in wallet')
+        self.channel_backups[channel_id] = cb
+        self.wallet.save_db()
+
+    async def request_force_close(self, channel_id):
+        cb = self.channel_backups[channel_id]
+        peer_addr = LNPeerAddr(cb.host, cb.port, cb.node_id)
+        transport = LNTransport(cb.privkey, peer_addr)
+        peer = Peer(self, cb.node_id, transport)
+        await self.taskgroup.spawn(peer.main_loop())
+        await peer.initialized
+        await self.taskgroup.spawn(peer.trigger_force_close(channel_id))

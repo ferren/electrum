@@ -269,7 +269,13 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         if backup_dir is None:
             return
         new_db = WalletDB(self.db.dump(), manual_upgrades=False)
-        new_db.put('is_backup', True)
+
+        if self.lnworker:
+            channel_backups = new_db.get_dict('channel_backups')
+            for chan_id, chan in self.lnworker.channels.items():
+                channel_backups[chan_id.hex()] = self.lnworker.create_channel_backup(chan_id)
+            new_db.put('channels', None)
+
         new_path = os.path.join(backup_dir, self.basename() + '.backup')
         new_storage = WalletStorage(new_path)
         new_storage._encryption_version = self.storage._encryption_version
@@ -305,9 +311,6 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         self.db.put('lightning_privkey2', None)
         self.save_db()
 
-    def is_lightning_backup(self):
-        return self.has_lightning() and self.db.get('is_backup')
-
     def stop_threads(self):
         super().stop_threads()
         if any([ks.is_requesting_to_be_rewritten_to_wallet_file for ks in self.get_keystores()]):
@@ -324,7 +327,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
 
     def start_network(self, network):
         AddressSynchronizer.start_network(self, network)
-        if self.lnworker and network and not self.is_lightning_backup():
+        if self.lnworker and network:
             network.maybe_init_lightning()
             self.lnworker.start_network(network)
 

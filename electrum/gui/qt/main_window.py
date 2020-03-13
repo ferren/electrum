@@ -524,18 +524,6 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
             ])
             self.show_warning(msg, title=_('Watch-only wallet'))
 
-    def warn_if_lightning_backup(self):
-        if self.wallet.is_lightning_backup():
-            msg = '\n\n'.join([
-                _("This file is a backup of a lightning wallet."),
-                _("You will not be able to perform lightning payments using this file, and the lightning balance displayed in this wallet might be outdated.") + ' ' + \
-                _("If you have lost the original wallet file, you can use this file to trigger a forced closure of your channels."),
-                _("Do you want to have your channels force-closed?")
-            ])
-            if self.question(msg, title=_('Lightning Backup')):
-                self.network.maybe_init_lightning()
-                self.wallet.lnworker.start_network(self.network)
-
     def warn_if_testnet(self):
         if not constants.net.TESTNET:
             return
@@ -572,14 +560,44 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
             return
         self.gui_object.new_window(filename)
 
+    def select_backup_dir(self, b):
+        name = self.config.get('backup_dir', '')
+        dirname = QFileDialog.getExistingDirectory(self, "Select your SSL certificate file", name)
+        if dirname:
+            self.config.set_key('backup_dir', dirname)
+            self.backup_dir_e.setText(dirname)
+
     def backup_wallet(self):
+        d = WindowModalDialog(self, _("File Backup"))
+        vbox = QVBoxLayout(d)
+        grid = QGridLayout()
+        backup_help = ""
+        backup_dir = self.config.get('backup_dir')
+        backup_dir_label = HelpLabel(_('Backup directory') + ':', backup_help)
+        msg = _('Please select a backup directory')
+        if self.wallet.lnworker and self.wallet.lnworker.channels:
+            msg += '\n\n' + ' '.join([
+                _("Note that lightning channels will be converted to channel backups."),
+                _("You cannot use channel backups to perform lightning payments."),
+                _("Channel backups can only be used to request your channels to be closed.")
+            ])
+        self.backup_dir_e = QPushButton(backup_dir)
+        self.backup_dir_e.clicked.connect(self.select_backup_dir)
+        grid.addWidget(backup_dir_label, 1, 0)
+        grid.addWidget(self.backup_dir_e, 1, 1)
+        vbox.addLayout(grid)
+        vbox.addWidget(WWLabel(msg))
+        vbox.addLayout(Buttons(CancelButton(d), OkButton(d)))
+        if not d.exec_():
+            return
         try:
             new_path = self.wallet.save_backup()
         except BaseException as reason:
             self.show_critical(_("Electrum was unable to copy your wallet file to the specified location.") + "\n" + str(reason), title=_("Unable to create backup"))
             return
         if new_path:
-            self.show_message(_("A copy of your wallet file was created in")+" '%s'" % str(new_path), title=_("Wallet backup created"))
+            msg = _("A copy of your wallet file was created in")+" '%s'" % str(new_path)
+            self.show_message(msg, title=_("Wallet backup created"))
         else:
             self.show_message(_("You need to configure a backup directory in your preferences"), title=_("Backup not created"))
 
